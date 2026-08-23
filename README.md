@@ -114,7 +114,7 @@ This builds on an earlier prototype (**Voltiva 1.0**) developed the previous sem
 
 <div align="center">
 
-![Circuit Diagram](diagram.jpg)
+![Circuit Diagram](Circuit diagram.jpg)
 
 </div>
 
