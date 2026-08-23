@@ -1,0 +1,260 @@
+// Voltiva 2.0 — IoT Smart Energy Meter
+// ESP32 + ZMPT101B (voltage) + ACS712 (current) + Blynk + Telegram
+
+#define BLYNK_TEMPLATE_ID   "YOUR_BLYNK_TEMPLATE_ID"      // Set your own Blynk template ID
+#define BLYNK_TEMPLATE_NAME "YOUR_BLYNK_TEMPLATE_NAME"    // Set your own Blynk template name
+#define BLYNK_AUTH_TOKEN    "YOUR_BLYNK_AUTH_TOKEN"       // Set your own Blynk auth token
+#define BLYNK_PRINT Serial
+
+#include "EmonLib.h"
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// --- Telegram bot credentials ---
+// Keep these out of version control (e.g. move to a gitignored secrets.h)
+const char* telegramBotToken = "YOUR_TELEGRAM_BOT_TOKEN";
+const char* telegramChatID   = "YOUR_TELEGRAM_CHAT_ID";
+
+// --- Sensor calibration (tune to your hardware) ---
+const float vCalibration = 125.10;
+const float currCalibration = 1.89;
+
+// --- WiFi / Blynk credentials ---
+const char auth[] = "YOUR_BLYNK_AUTH_TOKEN";
+const char ssid[] = "YOUR_WIFI_SSID";
+const char pass[] = "YOUR_WIFI_PASSWORD";
+
+EnergyMonitor emon;
+BlynkTimer timer;
+
+float kWh = 0.0;
+float cost = 0.0;
+float sessionKWh = 0.0;
+float sessionCost = 0.0;
+unsigned long lastMillis = millis();
+unsigned long sessionStartMillis = 0;
+bool sessionStarted = false;
+
+const int addrKWh = 12;
+const int addrCost = 16;
+
+int displayPage = 0;
+const int resetButtonPin = 4;
+
+void sendEnergyDataToBlynk();
+void readEnergyDataFromEEPROM();
+void saveEnergyDataToEEPROM();
+void updateLCD();
+void changeDisplayPage();
+void sendBillToTelegram();
+void resetEEPROM();
+float calculateCEBCost(float units);
+void checkPlugOut();
+
+void setup() {
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  Blynk.begin(auth, ssid, pass);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Welcome to");
+  lcd.setCursor(0, 1);
+  lcd.print("Voltiva 2.0");
+  delay(3000);
+  lcd.clear();
+
+  EEPROM.begin(32);
+  pinMode(resetButtonPin, INPUT_PULLUP);
+
+  readEnergyDataFromEEPROM();
+
+  emon.voltage(35, vCalibration, 1.7);
+  emon.current(34, currCalibration);
+
+  timer.setInterval(1000L, sendEnergyDataToBlynk);
+  timer.setInterval(2000L, changeDisplayPage);
+  timer.setInterval(60000L, sendBillToTelegram);
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+  checkPlugOut();
+
+  if (digitalRead(resetButtonPin) == LOW) {
+    delay(200);
+    resetEEPROM();
+  }
+}
+
+void sendEnergyDataToBlynk() {
+  emon.calcVI(20, 2000);
+  float Vrms = emon.Vrms;
+  float Irms = emon.Irms;
+  float apparentPower = emon.apparentPower;
+
+  if (!sessionStarted && Irms > 0.1) {
+    sessionStarted = true;
+    sessionStartMillis = millis();
+    lastMillis = sessionStartMillis;
+    sessionKWh = 0.0;
+    sessionCost = 0.0;
+  }
+
+  unsigned long currentMillis = millis();
+  if (sessionStarted) {
+    float deltaTime = (currentMillis - lastMillis) / 3600000000.0;
+    float incrementalKWh = apparentPower * deltaTime;
+    kWh += incrementalKWh;
+    sessionKWh += incrementalKWh;
+    cost = calculateCEBCost(kWh);
+    sessionCost = calculateCEBCost(sessionKWh);
+    lastMillis = currentMillis;
+  }
+
+  saveEnergyDataToEEPROM();
+
+  Blynk.virtualWrite(V0, Vrms);
+  Blynk.virtualWrite(V1, Irms);
+  Blynk.virtualWrite(V2, apparentPower);
+  Blynk.virtualWrite(V3, kWh);
+  Blynk.virtualWrite(V4, cost);
+
+  updateLCD();
+}
+
+void readEnergyDataFromEEPROM() {
+  EEPROM.get(addrKWh, kWh);
+  EEPROM.get(addrCost, cost);
+
+  if (isnan(kWh)) {
+    kWh = 0.0;
+    saveEnergyDataToEEPROM();
+  }
+  if (isnan(cost)) {
+    cost = 0.0;
+    saveEnergyDataToEEPROM();
+  }
+}
+
+void saveEnergyDataToEEPROM() {
+  EEPROM.put(addrKWh, kWh);
+  EEPROM.put(addrCost, cost);
+  EEPROM.commit();
+}
+
+void updateLCD() {
+  lcd.clear();
+  if (displayPage == 0) {
+    lcd.setCursor(0, 0);
+    lcd.printf("V:%.1fV I:%.2fA", emon.Vrms, emon.Irms);
+    lcd.setCursor(0, 1);
+    lcd.printf("P:%.1fW", emon.apparentPower);
+  } else if (displayPage == 1) {
+    lcd.setCursor(0, 0);
+    lcd.printf("Energy: %.3fkWh", kWh);
+    lcd.setCursor(0, 1);
+    lcd.printf("Cost Rs: %.5f", cost);
+  }
+}
+
+void changeDisplayPage() {
+  displayPage = (displayPage + 1) % 2;
+  updateLCD();
+}
+
+void sendBillToTelegram() {
+  if (!sessionStarted || millis() - sessionStartMillis < 60000) return;
+
+  String message = "🔌 Voltiva 2.0 Usage Update\n";
+  message += "⚡ Voltage: " + String(emon.Vrms, 1) + " V\n";
+  message += "💡 Current: " + String(emon.Irms, 2) + " A\n";
+  message += "🔋 Power: " + String(emon.apparentPower, 2) + " W\n";
+  message += "📊 Total Energy: " + String(kWh, 6) + " kWh\n";
+  message += "💰 Total Cost: Rs. " + String(cost, 6);
+
+  HTTPClient http;
+  http.begin("https://api.telegram.org/bot" + String(telegramBotToken) + "/sendMessage");
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument jsonDoc(512);
+  jsonDoc["chat_id"] = telegramChatID;
+  jsonDoc["text"] = message;
+
+  String jsonString;
+  serializeJson(jsonDoc, jsonString);
+  http.POST(jsonString);
+  http.end();
+}
+
+void resetEEPROM() {
+  kWh = 0.0;
+  cost = 0.0;
+  saveEnergyDataToEEPROM();
+}
+
+void checkPlugOut() {
+  static bool wasPlugged = false;
+  float current = emon.Irms;
+
+  if (current > 0.1) {
+    wasPlugged = true;
+  } else if (wasPlugged && current <= 0.1) {
+    unsigned long sessionEndMillis = millis();
+    float sessionDurationMin = (sessionEndMillis - sessionStartMillis) / 60000.0;
+    String msg = "🔌 Plugged off after " + String(sessionDurationMin, 2) + " min\n";
+    msg += "📊 Session Energy: " + String(sessionKWh, 4) + " kWh\n";
+    msg += "💰 Session Cost: Rs. " + String(sessionCost, 6);
+
+    HTTPClient http;
+    http.begin("https://api.telegram.org/bot" + String(telegramBotToken) + "/sendMessage");
+    http.addHeader("Content-Type", "application/json");
+
+    DynamicJsonDocument jsonDoc(512);
+    jsonDoc["chat_id"] = telegramChatID;
+    jsonDoc["text"] = msg;
+
+    String jsonString;
+    serializeJson(jsonDoc, jsonString);
+    http.POST(jsonString);
+    http.end();
+
+    wasPlugged = false;
+    sessionStarted = false;
+  }
+}
+
+float calculateCEBCost(float units) {
+  float cost = 0;
+  if (units <= 30) {
+    cost = units * 8.0;
+    if (units > 0.5) cost += 120 * (units / 30.0);
+  } else if (units <= 60) {
+    cost = (30 * 8.0) + (units - 30) * 10.0;
+    cost += 240 * (units / 60.0);
+  } else if (units <= 90) {
+    cost = (30 * 8.0) + (30 * 10.0) + (units - 60) * 16.0;
+    cost += 360 * (units / 90.0);
+  } else if (units <= 120) {
+    cost = (30 * 8.0) + (30 * 10.0) + (30 * 16.0) + (units - 90) * 32.0;
+    cost += 480 * (units / 120.0);
+  } else if (units <= 180) {
+    cost = (30 * 8.0) + (30 * 10.0) + (30 * 16.0) + (30 * 32.0) + (units - 120) * 45.0;
+    cost += 540 * (units / 180.0);
+  } else {
+    cost = (30 * 8.0) + (30 * 10.0) + (30 * 16.0) + (30 * 32.0) + (60 * 45.0) + (units - 180) * 50.0;
+    cost += 600 * (units / 180.0);
+  }
+  return cost;
+}
