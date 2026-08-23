@@ -109,14 +109,9 @@ This builds on an earlier prototype (**Voltiva 1.0**) developed the previous sem
 | Resistors and Wires | Assorted | Circuit connections |
 
 ---
-
 ## 📐 Circuit Diagram
 
-<div align="center">
-
-![Circuit Diagram](Circuit diagram.jpg)
-
-</div>
+![Circuit Diagram](Circuit%20diagram.jpg)
 
 ---
 
@@ -163,8 +158,8 @@ Install the following libraries via the **Arduino Library Manager** or **Platfor
 1. **Clone the repository**
 
 ```bash
-git clone https://github.com/<your-username>/voltiva-smart-energy-meter.git
-cd voltiva-smart-energy-meter
+git clone https://github.com/nishenfernando14/Voltiva-2.0-Creative-Design-Project.git
+cd Voltiva-2.0-Creative-Design-Project
 ```
 
 2. **Install libraries** — Use the Arduino Library Manager or add them to `platformio.ini`.
